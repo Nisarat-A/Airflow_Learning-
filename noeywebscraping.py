@@ -5,12 +5,15 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
+import pandas as pd
+import plotly.express as px
+from pathlib import Path
 import logging
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Create table SQL
+# SQL for table creation
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS cryptocurrency (
     id SERIAL PRIMARY KEY,
@@ -32,7 +35,7 @@ def scrape_crypto_data(ti):
         
         data = []
         table = soup.find('table', {'class': 'table-scrollable'})
-        rows = table.find('tbody').find_all('tr')[:10]
+        rows = table.find('tbody').find_all('tr')[:10]  # Top 10 cryptocurrencies
         
         for row in rows:
             cols = row.find_all('td')
@@ -43,7 +46,7 @@ def scrape_crypto_data(ti):
             data.append((name, price_usd, market_cap, volume))
         
         ti.xcom_push(key='crypto_data', value=data)
-        logger.info(f"Scraped {len(data)} cryptocurrencies")
+        logger.info(f"Successfully scraped {len(data)} cryptocurrencies")
         
     except Exception as e:
         logger.error(f"Error scraping data: {e}")
@@ -57,68 +60,161 @@ def fetch_exchange_rate(ti):
         rate = response.json()['rates']['THB']
         
         ti.xcom_push(key='exchange_rate', value=rate)
-        logger.info(f"Fetched exchange rate: 1 USD = {rate} THB")
+        logger.info(f"Exchange rate fetched: 1 USD = {rate} THB")
         
     except Exception as e:
         logger.error(f"Error fetching exchange rate: {e}")
         raise
 
 def transform_and_insert(ti):
-    """Transform data and insert into database"""
+    """Transform and insert data into database"""
     try:
-        # Get data from XCom
         crypto_data = ti.xcom_pull(key='crypto_data', task_ids='scrape_crypto')
         exchange_rate = ti.xcom_pull(key='exchange_rate', task_ids='fetch_exchange')
         
-        # Transform data
         transformed_data = [
             (
                 name,
                 price_usd,
-                price_usd * exchange_rate,  # Convert to THB
+                price_usd * exchange_rate,
                 market_cap,
                 volume
             )
             for name, price_usd, market_cap, volume in crypto_data
         ]
         
-        # Insert into database
         postgres = PostgresHook(postgres_conn_id='postgres_default')
         insert_sql = """
         INSERT INTO cryptocurrency (name, price_usd, price_thb, market_cap, volume)
         VALUES (%s, %s, %s, %s, %s)
         """
         postgres.run(insert_sql, parameters=transformed_data)
-        
         logger.info(f"Inserted {len(transformed_data)} rows into database")
         
     except Exception as e:
         logger.error(f"Error in transform and insert: {e}")
         raise
 
-def load_data():
-    """Load and verify data"""
+def export_data():
+    """Export cryptocurrency data to multiple formats"""
     try:
+        # Create export directory in the DAGs folder
+        export_dir = Path('/opt/airflow/dags/exports')
+        export_dir.mkdir(exist_ok=True)
+        
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        # Get data from database
         postgres = PostgresHook(postgres_conn_id='postgres_default')
+        query = """
+        SELECT 
+            name,
+            price_usd,
+            price_thb,
+            market_cap,
+            volume,
+            created_at
+        FROM cryptocurrency 
+        WHERE DATE(created_at) = CURRENT_DATE
+        ORDER BY market_cap DESC;
+        """
         
-        # Get latest data count
-        result = postgres.get_first("SELECT COUNT(*) FROM cryptocurrency")
-        total_rows = result[0]
+        df = postgres.get_pandas_df(query)
         
-        # Get latest prices
-        latest = postgres.get_records("""
-            SELECT name, price_usd, price_thb 
-            FROM cryptocurrency 
-            WHERE created_at >= NOW() - INTERVAL '1 day'
-            ORDER BY created_at DESC 
-            LIMIT 5
+        # 1. Export to CSV
+        csv_path = export_dir / f'crypto_prices_{today}.csv'
+        df.to_csv(csv_path, index=False)
+        
+        # 2. Export to Excel
+        excel_path = export_dir / f'crypto_prices_{today}.xlsx'
+        with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
+            # Main data sheet
+            df.to_excel(writer, sheet_name='Prices', index=False)
+            
+            # Summary sheet
+            summary = pd.DataFrame({
+                'Metric': [
+                    'Total Cryptocurrencies',
+                    'Average Price (USD)',
+                    'Total Market Cap (USD)',
+                    'Date Generated'
+                ],
+                'Value': [
+                    len(df),
+                    f"${df['price_usd'].mean():,.2f}",
+                    f"${df['market_cap'].sum():,.2f}",
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                ]
+            })
+            summary.to_excel(writer, sheet_name='Summary', index=False)
+            
+            # Format Excel
+            workbook = writer.book
+            money_fmt = workbook.add_format({'num_format': '$#,##0.00'})
+            worksheet = writer.sheets['Prices']
+            worksheet.set_column('B:C', 15, money_fmt)
+            worksheet.set_column('D:E', 20, money_fmt)
+        
+        # 3. Generate HTML report
+        html_path = export_dir / f'crypto_report_{today}.html'
+        
+        # Create visualizations
+        fig1 = px.bar(
+            df,
+            x='name',
+            y=['price_usd', 'price_thb'],
+            title='Cryptocurrency Prices (USD vs THB)',
+            barmode='group'
+        )
+        
+        fig2 = px.pie(
+            df,
+            values='market_cap',
+            names='name',
+            title='Market Cap Distribution'
+        )
+        
+        html_content = f"""
+        <html>
+            <head>
+                <title>Crypto Market Report - {today}</title>
+                <style>
+                    body {{ font-family: Arial, sans-serif; padding: 20px; }}
+                    table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
+                    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                    th {{ background-color: #f2f2f2; }}
+                </style>
+            </head>
+            <body>
+                <h1>Cryptocurrency Market Report - {today}</h1>
+                
+                <h2>Market Overview</h2>
+                {summary.to_html(index=False)}
+                
+                <h2>Price Comparison</h2>
+                {fig1.to_html()}
+                
+                <h2>Market Cap Distribution</h2>
+                {fig2.to_html()}
+                
+                <h2>Detailed Price Data</h2>
+                {df.to_html(index=False)}
+            </body>
+        </html>
+        """
+        
+        with open(html_path, 'w') as f:
+            f.write(html_content)
+        
+        logger.info(f"""
+        Export completed successfully:
+        - CSV: {csv_path}
+        - Excel: {excel_path}
+        - HTML Report: {html_path}
         """)
         
-        logger.info(f"Total rows in database: {total_rows}")
-        logger.info("Latest prices loaded successfully")
-        
     except Exception as e:
-        logger.error(f"Error in load step: {e}")
+        logger.error(f"Error in data export: {e}")
         raise
 
 # DAG definition
@@ -129,12 +225,13 @@ default_args = {
 }
 
 dag = DAG(
-    'simple_crypto_etl',
+    'crypto_etl_pipeline',
     default_args=default_args,
-    description='Simple cryptocurrency ETL pipeline',
+    description='ETL pipeline for cryptocurrency data with exports',
     schedule_interval=timedelta(hours=1),
     start_date=datetime(2025, 1, 1),
-    catchup=False
+    catchup=False,
+    tags=['crypto', 'etl']
 )
 
 # Create tasks
@@ -163,11 +260,10 @@ transform_insert = PythonOperator(
     dag=dag
 )
 
-load_data_task = PythonOperator(
-    task_id='load_data',
-    python_callable=load_data,
+export_reports = PythonOperator(
+    task_id='export_reports',
+    python_callable=export_data,
     dag=dag
 )
 
-# Set dependencies exactly as requested
-create_table >> [scrape_crypto, fetch_exchange] >> transform_insert >> load_data_task
+create_table >> [scrape_crypto, fetch_exchange] >> transform_insert >> export_reports
