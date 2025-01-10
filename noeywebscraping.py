@@ -6,50 +6,49 @@ from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import plotly.express as px
 from pathlib import Path
 import logging
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# SQL for table creation
+# SQL for table creation - simplified for Bitcoin only
 CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS cryptocurrency (
+CREATE TABLE IF NOT EXISTS bitcoin_price (
     id SERIAL PRIMARY KEY,
-    name VARCHAR(50),
     price_usd DECIMAL(18,8),
     price_thb DECIMAL(18,8),
-    market_cap DECIMAL(18,2),
-    volume DECIMAL(18,2),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
 
-def scrape_crypto_data(ti):
-    """Scrape cryptocurrency data from CoinGecko"""
+def scrape_bitcoin_price(ti):
+    """Scrape Bitcoin price from Google"""
     try:
-        url = "https://www.coingecko.com/en"
-        response = requests.get(url, timeout=10)
-        soup = BeautifulSoup(response.content, 'html.parser')
+        url = 'https://www.google.com/search?q=bitcoin+price+dollar'
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
         
-        data = []
-        table = soup.find('table', {'class': 'table-scrollable'})
-        rows = table.find('tbody').find_all('tr')[:10]  # Top 10 cryptocurrencies
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
         
-        for row in rows:
-            cols = row.find_all('td')
-            name = cols[2].get_text(strip=True).split('\n')[0]
-            price_usd = float(cols[3].get_text(strip=True).replace('$', '').replace(',', ''))
-            market_cap = float(cols[6].get_text(strip=True).replace('$', '').replace(',', ''))
-            volume = float(cols[7].get_text(strip=True).replace('$', '').replace(',', ''))
-            data.append((name, price_usd, market_cap, volume))
+        price_element = soup.find('span', class_="pclqee")
+        if not price_element:
+            raise ValueError("Bitcoin price element not found on the page")
+            
+        price_str = price_element.text.replace('$', '').replace(',', '')
+        price_usd = float(price_str)
         
-        ti.xcom_push(key='crypto_data', value=data)
-        logger.info(f"Successfully scraped {len(data)} cryptocurrencies")
+        ti.xcom_push(key='btc_price', value=price_usd)
+        logger.info(f"Successfully scraped Bitcoin price: ${price_usd:,.2f}")
         
+    except requests.exceptions.RequestException as req_err:
+        logger.error(f"HTTP request error: {req_err}")
+        raise
     except Exception as e:
-        logger.error(f"Error scraping data: {e}")
+        logger.error(f"Error scraping Bitcoin price: {e}")
         raise
 
 def fetch_exchange_rate(ti):
@@ -67,152 +66,96 @@ def fetch_exchange_rate(ti):
         raise
 
 def transform_and_insert(ti):
-    """Transform and insert data into database"""
+    """Transform and insert Bitcoin price data into database"""
     try:
-        crypto_data = ti.xcom_pull(key='crypto_data', task_ids='scrape_crypto')
+        btc_price_usd = ti.xcom_pull(key='btc_price', task_ids='scrape_bitcoin')
         exchange_rate = ti.xcom_pull(key='exchange_rate', task_ids='fetch_exchange')
         
-        transformed_data = [
-            (
-                name,
-                price_usd,
-                price_usd * exchange_rate,
-                market_cap,
-                volume
-            )
-            for name, price_usd, market_cap, volume in crypto_data
-        ]
+        btc_price_thb = btc_price_usd * exchange_rate
         
-        postgres = PostgresHook(postgres_conn_id='postgres_default')
+        postgres = PostgresHook(postgres_conn_id='Noey_Interns')
         insert_sql = """
-        INSERT INTO cryptocurrency (name, price_usd, price_thb, market_cap, volume)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO bitcoin_price (price_usd, price_thb)
+        VALUES (%s, %s)
         """
-        postgres.run(insert_sql, parameters=transformed_data)
-        logger.info(f"Inserted {len(transformed_data)} rows into database")
+        postgres.run(insert_sql, parameters=(btc_price_usd, btc_price_thb))
+        logger.info(f"Inserted Bitcoin price: ${btc_price_usd:,.2f} (฿{btc_price_thb:,.2f})")
         
     except Exception as e:
         logger.error(f"Error in transform and insert: {e}")
         raise
 
 def export_data():
-    """Export cryptocurrency data to multiple formats"""
+    """Export Bitcoin price data to multiple formats and summarize trends."""
     try:
         # Create export directory in the DAGs folder
-        export_dir = Path('/opt/airflow/dags/noey_reports')
+        export_dir = Path('/opt/airflow/dags/bitcoin_reports')
         export_dir.mkdir(exist_ok=True)
-        
+
         today = datetime.now().strftime('%Y-%m-%d')
-        
+
         # Get data from database
-        postgres = PostgresHook(postgres_conn_id='postgres_default')
+        postgres = PostgresHook(postgres_conn_id='Noey_Interns')
         query = """
         SELECT 
-            name,
             price_usd,
             price_thb,
-            market_cap,
-            volume,
             created_at
-        FROM cryptocurrency 
+        FROM bitcoin_price 
         WHERE DATE(created_at) = CURRENT_DATE
-        ORDER BY market_cap DESC;
+        ORDER BY created_at DESC;
         """
-        
+
         df = postgres.get_pandas_df(query)
-        
+
         # 1. Export to CSV
-        csv_path = export_dir / f'crypto_prices_{today}.csv'
+        csv_path = export_dir / f'bitcoin_prices_{today}.csv'
         df.to_csv(csv_path, index=False)
-        
-        # 2. Export to Excel
-        excel_path = export_dir / f'crypto_prices_{today}.xlsx'
+
+        # 2. Export to Excel with summary
+        excel_path = export_dir / f'bitcoin_analysis_{today}.xlsx'
         with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
             # Main data sheet
             df.to_excel(writer, sheet_name='Prices', index=False)
-            
+
             # Summary sheet
             summary = pd.DataFrame({
                 'Metric': [
-                    'Total Cryptocurrencies',
-                    'Average Price (USD)',
-                    'Total Market Cap (USD)',
+                    'Latest Price (USD)',
+                    'Latest Price (THB)',
+                    'Daily High (USD)',
+                    'Daily Low (USD)',
+                    'Price Change (%)',
                     'Date Generated'
                 ],
                 'Value': [
-                    len(df),
-                    f"${df['price_usd'].mean():,.2f}",
-                    f"${df['market_cap'].sum():,.2f}",
+                    f"${df['price_usd'].iloc[0]:,.2f}",
+                    f"฿{df['price_thb'].iloc[0]:,.2f}",
+                    f"${df['price_usd'].max():,.2f}",
+                    f"${df['price_usd'].min():,.2f}",
+                    f"{((df['price_usd'].iloc[0] - df['price_usd'].iloc[-1]) / df['price_usd'].iloc[-1] * 100):,.2f}%",
                     datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 ]
             })
             summary.to_excel(writer, sheet_name='Summary', index=False)
-            
-            # Format Excel
-            workbook = writer.book
-            money_fmt = workbook.add_format({'num_format': '$#,##0.00'})
-            worksheet = writer.sheets['Prices']
-            worksheet.set_column('B:C', 15, money_fmt)
-            worksheet.set_column('D:E', 20, money_fmt)
-        
-        # 3. Generate HTML report
-        html_path = export_dir / f'crypto_report_{today}.html'
-        
-        # Create visualizations
-        fig1 = px.bar(
-            df,
-            x='name',
-            y=['price_usd', 'price_thb'],
-            title='Cryptocurrency Prices (USD vs THB)',
-            barmode='group'
-        )
-        
-        fig2 = px.pie(
-            df,
-            values='market_cap',
-            names='name',
-            title='Market Cap Distribution'
-        )
-        
-        html_content = f"""
-        <html>
-            <head>
-                <title>Crypto Market Report - {today}</title>
-                <style>
-                    body {{ font-family: Arial, sans-serif; padding: 20px; }}
-                    table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
-                    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-                    th {{ background-color: #f2f2f2; }}
-                </style>
-            </head>
-            <body>
-                <h1>Cryptocurrency Market Report - {today}</h1>
-                
-                <h2>Market Overview</h2>
-                {summary.to_html(index=False)}
-                
-                <h2>Price Comparison</h2>
-                {fig1.to_html()}
-                
-                <h2>Market Cap Distribution</h2>
-                {fig2.to_html()}
-                
-                <h2>Detailed Price Data</h2>
-                {df.to_html(index=False)}
-            </body>
-        </html>
-        """
-        
-        with open(html_path, 'w') as f:
-            f.write(html_content)
-        
+
+        # 3. Generate Text-Based Price History
+        trend_report = "Bitcoin Price History (Last 24 Hours):\n\n"
+        for _, row in df.iterrows():
+            trend_report += f"{row['created_at']}: ${row['price_usd']:,.2f} (฿{row['price_thb']:,.2f})\n"
+
+        # Save trend analysis
+        trend_path = export_dir / f'bitcoin_trend_{today}.txt'
+        with open(trend_path, 'w') as file:
+            file.write(trend_report)
+
         logger.info(f"""
         Export completed successfully:
         - CSV: {csv_path}
         - Excel: {excel_path}
-        - HTML Report: {html_path}
+        - Trend Analysis: {trend_path}
         """)
-        
+
     except Exception as e:
         logger.error(f"Error in data export: {e}")
         raise
@@ -225,13 +168,13 @@ default_args = {
 }
 
 dag = DAG(
-    'crypto_etl_pipeline',
+    'bitcoin_price_pipeline',
     default_args=default_args,
-    description='ETL pipeline for cryptocurrency data with exports',
-    schedule_interval=timedelta(hours=1),
+    description='ETL pipeline for Bitcoin price data from Google',
+    schedule_interval=timedelta(minutes=30),  # Run every 30 minutes
     start_date=datetime(2025, 1, 1),
     catchup=False,
-    tags=['crypto', 'etl']
+    tags=['bitcoin', 'etl']
 )
 
 # Create tasks
@@ -242,9 +185,9 @@ create_table = PostgresOperator(
     dag=dag
 )
 
-scrape_crypto = PythonOperator(
-    task_id='scrape_crypto',
-    python_callable=scrape_crypto_data,
+scrape_bitcoin = PythonOperator(
+    task_id='scrape_bitcoin',
+    python_callable=scrape_bitcoin_price,
     dag=dag
 )
 
@@ -266,4 +209,5 @@ export_reports = PythonOperator(
     dag=dag
 )
 
-create_table >> [scrape_crypto, fetch_exchange] >> transform_insert >> export_reports
+# Define task dependencies
+create_table >> [scrape_bitcoin, fetch_exchange] >> transform_insert >> export_reports
