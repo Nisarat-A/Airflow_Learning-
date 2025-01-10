@@ -237,7 +237,7 @@ dag = DAG(
 # Create tasks
 create_table = PostgresOperator(
     task_id='create_table',
-    postgres_conn_id='postgres_default',
+    postgres_conn_id='Noey_Interns',
     sql=CREATE_TABLE_SQL,
     dag=dag
 )
