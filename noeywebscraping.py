@@ -99,7 +99,7 @@ def export_data():
     """Export cryptocurrency data to multiple formats"""
     try:
         # Create export directory in the DAGs folder
-        export_dir = Path('/opt/airflow/dags/exports')
+        export_dir = Path('/opt/airflow/dags/noey_reports')
         export_dir.mkdir(exist_ok=True)
         
         today = datetime.now().strftime('%Y-%m-%d')
