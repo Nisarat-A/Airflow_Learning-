@@ -101,9 +101,9 @@ def generate_report(**context):
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    # 'email': ['noansrnn@gmail.com'],  # Replace with your recipient email
-    # 'email_on_failure': True,
-    # 'email_on_retry': True,
+    'email': ['noansrnn@gmail.com'],  # Replace with your recipient email
+    'email_on_failure': True,
+    'email_on_retry': True,
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
     'start_date': datetime(2025, 1, 6)
