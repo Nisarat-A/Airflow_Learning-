@@ -20,7 +20,6 @@ CREATE_GOLD_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS gold_price (
     id SERIAL PRIMARY KEY,
     price_usd DECIMAL(18,2),
-    price_thb DECIMAL(18,2),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -30,35 +29,25 @@ CREATE TABLE IF NOT EXISTS crypto_price (
     id SERIAL PRIMARY KEY,
     symbol VARCHAR(10),
     price_usd DECIMAL(18,8),
-    price_thb DECIMAL(18,8),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
 def scrape_gold_price(ti):
-    """Scrape gold price in USD from the specified Gold.org website."""
-    url = 'https://www.gold.org/goldhub/data#price-and-premium'
+    """Fetch gold price in USD from GoldAPI."""
+    url = 'https://www.goldapi.io/api/XAU/USD'
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.121 Safari/537.36"
+        'x-access-token': 'goldapi-c0ax6vsm5w6jqxb-io',
+        'Content-Type': 'application/json'
     }
     try:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        # Locate the <p class="value"> element for gold price
-        gold_price_element = soup.find('p', class_='value')
-        if not gold_price_element:
-            raise ValueError("Gold price element not found")
-
-        # Extract the gold price
-        gold_price_usd = float(gold_price_element.text.strip().replace(',', ''))
-
-        # Push the price to XCom
+        data = response.json()
+        gold_price_usd = data['price']
         ti.xcom_push(key='gold_price', value=gold_price_usd)
-
-        logger.info(f"Scraped Gold price: ${gold_price_usd:.2f}")
+        logging.info(f"Scraped Gold price: ${gold_price_usd:.2f}")
     except Exception as e:
-        logger.error(f"Error scraping Gold price: {e}")
+        logging.error(f"Error fetching Gold price: {e}")
         raise
 
 
@@ -87,33 +76,40 @@ def scrape_crypto_prices(ti):
         logger.error(f"Error fetching cryptocurrency prices: {e}")
         raise
 
-
+import requests
+import logging
 def transform_to_thai_baht(ti):
     """Convert USD prices to THB."""
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
     url = "https://api.exchangerate-api.com/v4/latest/USD"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        thb_rate = response.json()['rates']['THB']
-        
-        # Get prices from XCom
+        thb_rate = response.json().get('rates', {}).get('THB', None)
+
+        if thb_rate is None:
+            raise ValueError("THB exchange rate not found in response.")
+
         gold_price = ti.xcom_pull(key='gold_price', task_ids='scrape_gold')
         crypto_prices = ti.xcom_pull(key='crypto_prices', task_ids='scrape_crypto')
-        
-        # Transform prices
+
+        if gold_price is None or crypto_prices is None:
+            raise ValueError("Missing gold or crypto price data from XCom.")
+
         gold_thb = gold_price * thb_rate
         crypto_thb = {
-            symbol: {'thb': price['usd'] * thb_rate, 'usd': price['usd']}
+            symbol: {'thb': price * thb_rate, 'usd': price}
             for symbol, price in crypto_prices.items()
         }
-        
-        # Push transformed prices
+
         ti.xcom_push(key='gold_thb', value=gold_thb)
         ti.xcom_push(key='crypto_thb', value=crypto_thb)
-        logger.info(f"Transformed prices to THB with rate: {thb_rate}")
+        logger.info(f"Transformed prices to THB with rate: {thb_rate:.2f}")
     except Exception as e:
         logger.error(f"Error in THB transformation: {e}")
         raise
+
 
 def insert_gold_price(ti):
     """Insert gold price into database."""
@@ -362,3 +358,5 @@ send_email_task = EmailOperator(
 [scrape_gold_task >> transform_to_thai_baht_task, scrape_crypto_task >> transform_to_thai_baht_task]
 transform_to_thai_baht_task >> [create_gold_table_task >> insert_gold_task, create_bitcoin_table_task >> insert_bitcoin_task]
 [insert_gold_task, insert_bitcoin_task] >> make_report_task >> send_email_task
+
+
