@@ -70,6 +70,25 @@ def scrape_crypto_prices(ti):
     except Exception as e:
         logger.error(f"Error fetching cryptocurrency prices: {e}")
         raise
+def list_all_cryptocurrencies(ti):
+    """
+    Fetch and list all available cryptocurrencies from the CoinGecko API.
+    """
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/list"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+
+        # Parse and log the cryptocurrencies
+        cryptocurrencies = response.json()
+        logger.info(f"Fetched {len(cryptocurrencies)} cryptocurrencies from the API.")
+
+        # Push the list to XCom for downstream tasks
+        ti.xcom_push(key='cryptocurrencies', value=cryptocurrencies)
+    except Exception as e:
+        logger.error(f"Error fetching cryptocurrencies: {e}")
+        raise
+
 
 def transform_to_thai_baht(ti):
     """Convert USD prices to THB."""
@@ -260,7 +279,12 @@ send_email_task = EmailOperator(
     Airflow Pipeline
     """,
     files=['{{ ti.xcom_pull(task_ids="generate_report", key="report_path") }}'],
-    conn_id='noey_emails',  
+   conn_id='noey_email',  
+    dag=dag
+)
+list_all_cryptos_task = PythonOperator(
+    task_id='list_all_cryptos',
+    python_callable=list_all_cryptocurrencies,
     dag=dag
 )
 
